@@ -14,11 +14,12 @@
 
 package com.google.mediapipe.tasks.core;
 
-import com.google.mediapipe.tasks.core.OutputHandler.ValueListener;
-import com.google.mediapipe.tasks.core.jni.LlmOptionsProto.LlmModelParameters;
-import com.google.mediapipe.tasks.core.jni.LlmOptionsProto.LlmSessionConfig;
-import com.google.mediapipe.tasks.core.jni.LlmResponseContextProto.LlmResponseContext;
-import com.google.protobuf.ExtensionRegistryLite;
+import android.content.Context;
+import com.google.mediapipe.tasks.core.OutputHandler.ProgressListener;
+import com.google.mediapipe.tasks.core.jni.proto.LlmOptionsProto.LlmSessionConfig;
+import com.google.mediapipe.tasks.core.jni.proto.LlmResponseContextProto.LlmResponseContext;
+import com.google.mediapipe.tasks.core.logging.TasksStatsDummyLogger;
+import com.google.mediapipe.tasks.core.logging.TasksStatsLogger;
 import com.google.protobuf.InvalidProtocolBufferException;
 import java.util.List;
 import java.util.Optional;
@@ -30,15 +31,17 @@ import java.util.Optional;
  */
 public final class LlmTaskRunner implements AutoCloseable {
   private final long sessionHandle;
-  private final Optional<ValueListener<List<String>>> resultListener;
+  private final Optional<ProgressListener<List<String>>> resultListener;
   private final long callbackHandle;
+  private final TasksStatsLogger statsLogger;
 
   public LlmTaskRunner(
-      LlmModelParameters modelParameters,
+      Context context,
+      String taskName,
       LlmSessionConfig sessionConfig,
-      Optional<ValueListener<List<String>>> resultListener) {
-    this.sessionHandle =
-        nativeCreateSession(modelParameters.toByteArray(), sessionConfig.toByteArray());
+      Optional<ProgressListener<List<String>>> resultListener) {
+    statsLogger = TasksStatsDummyLogger.create(context, taskName, /* taskRunningModeStr= */ "");
+    this.sessionHandle = nativeCreateSession(sessionConfig.toByteArray());
 
     this.resultListener = resultListener;
     if (resultListener.isPresent()) {
@@ -46,12 +49,13 @@ public final class LlmTaskRunner implements AutoCloseable {
     } else {
       this.callbackHandle = 0;
     }
+    statsLogger.logSessionStart();
   }
 
   /** Invokes the LLM with the provided input and waits for the result. */
   public List<String> predictSync(String input) {
     byte[] responseBytes = nativePredictSync(sessionHandle, input);
-    return parseResponse(responseBytes);
+    return parseResponse(responseBytes).getResponsesList();
   }
 
   /** Invokes the LLM with the provided input and calls the callback with the result. */
@@ -62,18 +66,22 @@ public final class LlmTaskRunner implements AutoCloseable {
     nativePredictAsync(sessionHandle, callbackHandle, input);
   }
 
-  private List<String> parseResponse(byte[] reponse) {
+  /** Invokes the native token cost calculator and returns the size of the string in tokens. */
+  public int sizeInTokens(String text) {
+    return nativeSizeInTokens(sessionHandle, text);
+  }
+
+  private LlmResponseContext parseResponse(byte[] reponse) {
     try {
-      LlmResponseContext result =
-          LlmResponseContext.parseFrom(reponse, ExtensionRegistryLite.getGeneratedRegistry());
-      return result.getResponsesList();
+      return LlmResponseContext.parseFrom(reponse);
     } catch (InvalidProtocolBufferException e) {
       throw new IllegalStateException("Failed to parse response", e);
     }
   }
 
   private void onAsyncResponse(byte[] responseBytes) {
-    resultListener.get().run(parseResponse(responseBytes));
+    LlmResponseContext respone = parseResponse(responseBytes);
+    resultListener.get().run(respone.getResponsesList(), respone.getDone());
   }
 
   @Override
@@ -82,9 +90,10 @@ public final class LlmTaskRunner implements AutoCloseable {
       nativeRemoveCallback(callbackHandle);
     }
     nativeDeleteSession(sessionHandle);
+    statsLogger.logSessionEnd();
   }
 
-  private static native long nativeCreateSession(byte[] modelParameters, byte[] sessionConfig);
+  private static native long nativeCreateSession(byte[] sessionConfig);
 
   private static native void nativeDeleteSession(long sessionPointer);
 
@@ -96,4 +105,6 @@ public final class LlmTaskRunner implements AutoCloseable {
 
   private static native void nativePredictAsync(
       long sessionPointer, long callbackContextHandle, String input);
+
+  private static native int nativeSizeInTokens(long sessionPointer, String input);
 }

@@ -15,13 +15,21 @@
 #ifndef MEDIAPIPE_CALCULATORS_TENSOR_INFERENCE_CALCULATOR_H_
 #define MEDIAPIPE_CALCULATORS_TENSOR_INFERENCE_CALCULATOR_H_
 
-#include <cstring>
+#include <algorithm>
+#include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
+#include "absl/time/time.h"
 #include "mediapipe/calculators/tensor/inference_calculator.pb.h"
+#include "mediapipe/calculators/tensor/inference_runner.h"
+#include "mediapipe/calculators/tensor/tensor_span.h"
 #include "mediapipe/framework/api2/node.h"
+#include "mediapipe/framework/api2/port.h"
 #include "mediapipe/framework/calculator_framework.h"
 #include "mediapipe/framework/formats/tensor.h"
 #include "mediapipe/util/tflite/tflite_model_loader.h"
@@ -51,14 +59,24 @@ namespace api2 {
 //  TENSORS - Vector of Tensors
 //
 // Input side packet:
-//  DEPRECATED: Prefer to use the "OP_RESOLVER" input side packet instead.
-//  CUSTOM_OP_RESOLVER (optional) - Use a custom op resolver,
-//                                  instead of the builtin one.
-//  OP_RESOLVER (optional) - Use to provide tflite op resolver
-//                           (tflite::OpResolver)
-//  MODEL (optional) - Use to specify TfLite model
-//                     (std::unique_ptr<tflite::FlatBufferModel,
-//                       std::function<void(tflite::FlatBufferModel*)>>)
+//  CUSTOM_OP_RESOLVER (optional)
+//    DEPRECATED: prefer to use the "OP_RESOLVER" input side packet instead.
+//    Use a custom op resolver, instead of the builtin one.
+//  OP_RESOLVER (optional)
+//    Use to provide tflite op resolver (tflite::OpResolver)
+//  MODEL (optional)
+//    Use to specify TfLite model.
+//    (std::unique_ptr<tflite::FlatBufferModel,
+//       std::function<void(tflite::FlatBufferModel*)>>)
+//  DELEGATE (optional)
+//    Use to specify special values per a particular delegate.
+//    (InferenceCalculatorOptions::Delegate)
+//
+//    NOTE: InferenceCalculator, being a subgraph which is replaced by concrete
+//      implementations/calculators during the graph expansion, cannot access
+//      side packets, and DELEGATE side packet rarely (only if concrete
+//      implementations/calculators allow that) can be used to switch between
+//      delegates.
 //
 // Example use:
 // node {
@@ -93,7 +111,16 @@ namespace api2 {
 
 class InferenceCalculator : public NodeIntf {
  public:
-  static constexpr Input<std::vector<Tensor>> kInTensors{"TENSORS"};
+  // Default API: inputs and outputs will be passed as a single vector.
+  static constexpr Input<std::vector<Tensor>>::Optional kInTensors{"TENSORS"};
+  static constexpr Output<std::vector<Tensor>>::Optional kOutTensors{"TENSORS"};
+
+  // New API (not yet supported by all subclasses): inputs and outputs will be
+  // passed as multiple (ordered) Tensor streams. Only one of the two APIs can
+  // be used, so TENSORS and TENSOR are mutually exclusive.
+  static constexpr Input<Tensor>::Multiple kInTensor{"TENSOR"};
+  static constexpr Output<Tensor>::Multiple kOutTensor{"TENSOR"};
+
   // Deprecated. Prefers to use "OP_RESOLVER" input side packet instead.
   // TODO: Removes the "CUSTOM_OP_RESOLVER" side input after the
   // migration.
@@ -102,18 +129,21 @@ class InferenceCalculator : public NodeIntf {
   static constexpr SideInput<tflite::OpResolver>::Optional kSideInOpResolver{
       "OP_RESOLVER"};
   static constexpr SideInput<TfLiteModelPtr>::Optional kSideInModel{"MODEL"};
-  static constexpr Output<std::vector<Tensor>> kOutTensors{"TENSORS"};
   static constexpr SideInput<
       mediapipe::InferenceCalculatorOptions::Delegate>::Optional kDelegate{
       "DELEGATE"};
-  MEDIAPIPE_NODE_CONTRACT(kInTensors, kSideInCustomOpResolver,
+  MEDIAPIPE_NODE_CONTRACT(kInTensors, kInTensor, kSideInCustomOpResolver,
                           kSideInOpResolver, kSideInModel, kOutTensors,
-                          kDelegate);
+                          kOutTensor, kDelegate);
 
  protected:
   using TfLiteDelegatePtr =
       std::unique_ptr<TfLiteOpaqueDelegate,
                       std::function<void(TfLiteOpaqueDelegate*)>>;
+
+  // Helper to be used in subclass UpdateContract calls to enforce constraints
+  // when TENSORS and TENSOR are both available.
+  static absl::Status TensorContractCheck(CalculatorContract* cc);
 
   static absl::StatusOr<Packet<TfLiteModelPtr>> GetModelAsPacket(
       CalculatorContext* cc);
@@ -144,6 +174,66 @@ struct InferenceCalculatorCpu : public InferenceCalculator {
 
 struct InferenceCalculatorXnnpack : public InferenceCalculator {
   static constexpr char kCalculatorName[] = "InferenceCalculatorXnnpack";
+};
+
+// For Process overriding, we subclass Impl rather than Intf
+// Subclasses must implement InferenceCalculatorNodeImpl's `Process` method.
+template <class Intf, class Impl = void>
+class InferenceCalculatorNodeImpl : public NodeImpl<Intf, Impl> {
+ public:
+  virtual ~InferenceCalculatorNodeImpl() = default;
+
+  // Override Process to handle common Tensor I/O functionality.
+  absl::Status Process(CalculatorContext* cc) final {
+    if (InferenceCalculator::kInTensors(cc).IsConnected()) {
+      // Using old vector<Tensor> inputs; skip if empty input stream, but error
+      // if the input vector is empty.
+      if (InferenceCalculator::kInTensors(cc).IsEmpty()) {
+        return absl::OkStatus();
+      }
+      const auto& input_tensors = *InferenceCalculator::kInTensors(cc);
+      RET_CHECK(!input_tensors.empty());
+      MP_ASSIGN_OR_RETURN(auto output_tensors,
+                          Process(cc, MakeTensorSpan(input_tensors)));
+      return SendOutputTensors(cc, std::move(output_tensors));
+    }
+
+    // Using new direct Tensor inputs; return early if any empty streams.
+    for (int i = 0; i < InferenceCalculator::kInTensor(cc).Count(); ++i) {
+      if (InferenceCalculator::kInTensor(cc)[i].IsEmpty()) {
+        return absl::OkStatus();
+      }
+    }
+
+    MP_ASSIGN_OR_RETURN(
+        auto output_tensors,
+        Process(cc, MakeTensorSpan(InferenceCalculator::kInTensor(cc))));
+    return SendOutputTensors(cc, std::move(output_tensors));
+  }
+
+  // Process call providing TensorSpan input.
+  virtual absl::StatusOr<std::vector<Tensor>> Process(
+      CalculatorContext* cc, const TensorSpan& tensor_span) = 0;
+
+ private:
+  // Send output tensors into the proper output streams, regardless of how those
+  // Tensors are expected to be sent. We take an rvalue-reference to ensure we
+  // can destroy/move the tensors.
+  static absl::Status SendOutputTensors(CalculatorContext* cc,
+                                        std::vector<Tensor>&& output_tensors) {
+    if (InferenceCalculator::kOutTensors(cc).IsConnected()) {
+      InferenceCalculator::kOutTensors(cc).Send(std::move(output_tensors));
+    } else {
+      const int output_count =
+          std::min(InferenceCalculator::kOutTensor(cc).Count(),
+                   static_cast<int>(output_tensors.size()));
+      for (int i = 0; i < output_count; ++i) {
+        InferenceCalculator::kOutTensor(cc)[i].Send(
+            std::move(output_tensors[i]));
+      }
+    }
+    return absl::OkStatus();
+  }
 };
 
 }  // namespace api2

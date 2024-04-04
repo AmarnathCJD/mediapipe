@@ -17,11 +17,14 @@ syntax = "proto3";
 
 package mediapipe.tasks.core.jni;
 
-option java_package = "com.google.mediapipe.tasks.core.jni";
+option java_package = "com.google.mediapipe.tasks.core.jni.proto";
 option java_outer_classname = "LlmResponseContextProto";
 
 // A response from an LLM.
 message LlmResponseContext {
   // The list of response tokens.
   repeated string responses = 1;
+
+  // Done all outputs for this session.
+  bool done = 2;
 }

@@ -16,100 +16,47 @@
 
 #include <jni.h>
 
+#include <cstdlib>
 #include <string>
 
+#include "absl/log/absl_log.h"
 #include "absl/status/status.h"
+#include "absl/strings/str_cat.h"
+#include "mediapipe/java/com/google/mediapipe/framework/jni/class_registry.h"
 #include "mediapipe/java/com/google/mediapipe/framework/jni/jni_util.h"
+#include "mediapipe/tasks/cc/genai/inference/c/llm_inference_engine.h"
 #include "mediapipe/tasks/java/com/google/mediapipe/tasks/core/jni/proto/llm_options.pb.h"
 #include "mediapipe/tasks/java/com/google/mediapipe/tasks/core/jni/proto/llm_response_context.pb.h"
-#include "odml/infra/genai/inference/c/llm_inference_engine.h"
 
 namespace {
 
-using LlmModelParametersProto = mediapipe::tasks::core::jni::LlmModelParameters;
 using LlmSessionConfigProto = mediapipe::tasks::core::jni::LlmSessionConfig;
 using LlmResponseContextProto = mediapipe::tasks::core::jni::LlmResponseContext;
 using mediapipe::android::JStringToStdString;
 using mediapipe::android::ThrowIfError;
-
-LlmModelParameters ParseModelParameters(void* bytes, int size) {
-  LlmModelParametersProto input;
-  input.ParseFromArray(bytes, size);
-
-  LlmModelParameters output;
-
-  switch (input.model_type()) {
-    case kFalcon1B:
-      output.model_type = kFalcon1B;
-      break;
-    case kGMini2B:
-      output.model_type = kGMini2B;
-      break;
-    default:
-      output.model_type = kUNKNOWN_MODEL_TYPE;
-  }
-
-  output.model_path = strdup(input.model_directory().c_str());
-
-  switch (input.attention_type()) {
-    case kMHA:
-      output.attention_type = kMHA;
-      break;
-    case kMQA:
-      output.attention_type = kMQA;
-      break;
-    default:
-      output.attention_type = kMHA;
-  }
-
-  output.start_token_id = input.start_token_id();
-
-  const char** stop_tokens = new const char*[input.stop_tokens_size()];
-  for (int i = 0; i < input.stop_tokens_size(); ++i) {
-    stop_tokens[i] = strdup(input.stop_tokens(i).c_str());
-  }
-  output.stop_tokens = stop_tokens;
-  output.stop_tokens_size = input.stop_tokens_size();
-
-  return output;
-}
-
-void CloseModelParameters(LlmModelParameters* model_parameters) {
-  delete model_parameters->model_path;
-  model_parameters->model_path = nullptr;
-
-  for (int i = 0; i < model_parameters->stop_tokens_size; ++i) {
-    delete model_parameters->stop_tokens[i];
-  }
-
-  delete[] model_parameters->stop_tokens;
-  model_parameters->stop_tokens = nullptr;
-  model_parameters->stop_tokens_size = 0;
-}
+using mediapipe::java::GetJNIEnv;
 
 LlmSessionConfig ParseSessionConfig(void* bytes, int size) {
   LlmSessionConfigProto input;
   input.ParseFromArray(bytes, size);
 
   LlmSessionConfig output;
-
-  switch (input.backend()) {
-    case LlmSessionConfigProto::CPU:
-      output.backend = kCPU;
-      break;
-    case LlmSessionConfigProto::GPU:
-      output.backend = kGPU;
-      break;
-    default:
-      output.backend = kCPU;
-  }
-
+  output.model_path = strdup(input.model_path().c_str());
+  output.cache_dir = strdup(input.cache_dir().c_str());
   output.sequence_batch_size = input.sequence_batch_size();
-  output.num_decode_tokens = input.num_decode_tokens();
-  output.max_sequence_length = input.max_sequence_length();
-  output.use_fake_weights = input.use_fake_weights();
-
+  output.num_decode_steps_per_sync = input.num_decode_steps_per_sync();
+  output.max_tokens = input.max_tokens();
+  output.temperature = input.temperature();
+  output.topk = input.topk();
+  output.random_seed = input.random_seed();
   return output;
+}
+
+void FreeSessionConfig(LlmSessionConfig* session_config) {
+  delete session_config->model_path;
+  delete session_config->cache_dir;
+  session_config->model_path = nullptr;
+  session_config->cache_dir = nullptr;
 }
 
 jbyteArray ToByteArray(JNIEnv* env, const LlmResponseContext& context) {
@@ -117,49 +64,41 @@ jbyteArray ToByteArray(JNIEnv* env, const LlmResponseContext& context) {
   for (int i = 0; i < context.response_count; ++i) {
     output.add_responses(context.response_array[i]);
   }
-  std::string output_str = output.SerializeAsString();
+  output.set_done(context.done);
 
-  jbyteArray data = env->NewByteArray(output_str.size());
-  env->SetByteArrayRegion(data, 0, output_str.size(),
-                          reinterpret_cast<const jbyte*>(output_str.data()));
+  std::string serialized_str = output.SerializeAsString();
+  jbyteArray data = env->NewByteArray(serialized_str.size());
+  env->SetByteArrayRegion(
+      data, 0, serialized_str.size(),
+      reinterpret_cast<const jbyte*>(serialized_str.data()));
   return data;
 }
 
-// A context object that is passed to the callback so that global state can be
-// recovered.
-typedef struct {
-  JNIEnv* env;
-  jobject global_callback_ref;
-  jmethodID callback_method_id;
-} CallbackContext;
+void ProcessAsyncResponse(void* callback_ref,
+                          const LlmResponseContext response_context) {
+  jobject object_ref = reinterpret_cast<jobject>(callback_ref);
+  JNIEnv* env = GetJNIEnv();
+  if (env == nullptr) {
+    ABSL_LOG(ERROR)
+        << "Failed to retrieve JNI environment. Cannot invoke callback.";
+    return;
+  }
 
-void ProcessAsyncResponse(void* callback_context_handle,
-                          const LlmResponseContext respone_context) {
-  CallbackContext* callback_context =
-      reinterpret_cast<CallbackContext*>(callback_context_handle);
-  JNIEnv* env = callback_context->env;
+  jclass class_ref = env->GetObjectClass(object_ref);
+  auto& class_registry = mediapipe::android::ClassRegistry::GetInstance();
+  std::string method_name = class_registry.GetMethodName(
+      "com/google/mediapipe/tasks/core/LlmTaskRunner", "onAsyncResponse");
+  jmethodID method_id =
+      env->GetMethodID(class_ref, method_name.c_str(), "([B)V");
 
-  const jbyteArray response_context_bytes = ToByteArray(env, respone_context);
-
-  env->CallVoidMethod(callback_context->global_callback_ref,
-                      callback_context->callback_method_id,
-                      response_context_bytes);
+  const jbyteArray response_context_bytes = ToByteArray(env, response_context);
+  env->CallVoidMethod(object_ref, method_id, response_context_bytes);
 }
 
 }  // namespace
 
 JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateSession)(
-    JNIEnv* env, jclass thiz, jbyteArray model_parameters_bytes,
-    jbyteArray session_config_bytes) {
-  // Retrieve the LLM model parameters.
-  jbyte* model_parameters_ref =
-      env->GetByteArrayElements(model_parameters_bytes, nullptr);
-  int model_parameters_size = env->GetArrayLength(model_parameters_bytes);
-  LlmModelParameters model_parameters = ParseModelParameters(
-      reinterpret_cast<void*>(model_parameters_ref), model_parameters_size);
-  env->ReleaseByteArrayElements(model_parameters_bytes, model_parameters_ref,
-                                JNI_ABORT);
-
+    JNIEnv* env, jclass thiz, jbyteArray session_config_bytes) {
   // Retrieve the LLM session configuration.
   jbyte* session_config_ref =
       env->GetByteArrayElements(session_config_bytes, nullptr);
@@ -169,10 +108,8 @@ JNIEXPORT jlong JNICALL JNI_METHOD(nativeCreateSession)(
   env->ReleaseByteArrayElements(session_config_bytes, session_config_ref,
                                 JNI_ABORT);
 
-  void* session =
-      LlmInferenceEngine_CreateSession(&model_parameters, &session_config);
-  CloseModelParameters(&model_parameters);
-
+  void* session = LlmInferenceEngine_CreateSession(&session_config);
+  FreeSessionConfig(&session_config);
   return reinterpret_cast<jlong>(session);
 }
 
@@ -193,37 +130,45 @@ JNIEXPORT jbyteArray JNICALL JNI_METHOD(nativePredictSync)(JNIEnv* env,
   return response_bytes;
 }
 
-JNIEXPORT jlong JNICALL JNI_METHOD(nativeRegisterCallback)(JNIEnv* env,
-                                                           jclass thiz,
-                                                           jobject callback) {
-  auto callback_class = env->GetObjectClass(callback);
-  auto global_callback_ref = env->NewGlobalRef(callback);
-  if (!global_callback_ref) {
-    ThrowIfError(env, absl::InternalError("Failed to allocate callback"));
-    return 0;
+JNIEXPORT jobject JNICALL JNI_METHOD(nativeRegisterCallback)(JNIEnv* env,
+                                                             jclass thiz,
+                                                             jobject callback) {
+  if (mediapipe::java::SetJavaVM(env)) {
+    auto callback_ref = env->NewGlobalRef(callback);
+    if (callback_ref) return callback_ref;
   }
-  auto callback_method_id =
-      env->GetMethodID(callback_class, "onAsyncResponse", "([B)V");
-
-  CallbackContext* callback_context =
-      new CallbackContext{env, global_callback_ref, callback_method_id};
-  return reinterpret_cast<jlong>(callback_context);
+  ThrowIfError(env, absl::InternalError("Failed to allocate callback"));
+  return nullptr;
 }
 
-JNIEXPORT void JNICALL JNI_METHOD(nativeRemoveCallback)(
-    JNIEnv* env, jclass thiz, jlong callback_context_handle) {
-  CallbackContext* callback_context =
-      reinterpret_cast<CallbackContext*>(callback_context_handle);
-  env->DeleteGlobalRef(callback_context->global_callback_ref);
-  delete reinterpret_cast<CallbackContext*>(callback_context);
+JNIEXPORT void JNICALL JNI_METHOD(nativeRemoveCallback)(JNIEnv* env,
+                                                        jclass thiz,
+                                                        jobject callback_ref) {
+  env->DeleteGlobalRef(callback_ref);
 }
 
-JNIEXPORT void JNICALL
-JNI_METHOD(nativePredictAsync)(JNIEnv* env, jclass thiz, jlong session_handle,
-                               jlong callback_context_handle, jstring input) {
+JNIEXPORT void JNICALL JNI_METHOD(nativePredictAsync)(JNIEnv* env, jclass thiz,
+                                                      jlong session_handle,
+                                                      jobject callback_ref,
+                                                      jstring input) {
   std::string input_str = JStringToStdString(env, input);
   LlmInferenceEngine_Session_PredictAsync(
-      reinterpret_cast<void*>(session_handle),
-      reinterpret_cast<void*>(callback_context_handle), input_str.c_str(),
+      reinterpret_cast<LlmInferenceEngine_Session*>(session_handle),
+      reinterpret_cast<void*>(callback_ref), input_str.c_str(),
       &ProcessAsyncResponse);
+}
+
+JNIEXPORT jint JNICALL JNI_METHOD(nativeSizeInTokens)(JNIEnv* env, jclass thiz,
+                                                      jlong session_handle,
+                                                      jstring input) {
+  std::string input_str = JStringToStdString(env, input);
+  char* error_msg = nullptr;
+  int size = LlmInferenceEngine_Session_SizeInTokens(
+      reinterpret_cast<void*>(session_handle), input_str.c_str(), &error_msg);
+  if (size == -1) {
+    ThrowIfError(env, absl::InternalError(absl::StrCat(
+                          "Failed to compute size: %s", error_msg)));
+    free(error_msg);
+  }
+  return size;
 }

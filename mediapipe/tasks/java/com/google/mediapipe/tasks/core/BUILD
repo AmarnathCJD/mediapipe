@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("//mediapipe/tasks/java/com/google/mediapipe/tasks:mediapipe_tasks_aar.bzl", "mediapipe_tasks_core_aar")
+
 package(default_visibility = ["//visibility:public"])
 
 android_library(
@@ -68,15 +70,21 @@ android_library(
     deps = ["@maven//:com_google_guava_guava"],
 )
 
+filegroup(
+    name = "llm_java_srcs",
+    srcs = ["LlmTaskRunner.java"],
+)
+
 android_library(
     name = "llm_java",
-    srcs = ["LlmTaskRunner.java"],
+    srcs = [":llm_java_srcs"],
     javacopts = [
         "-Xep:AndroidJdkLibsChecker:OFF",
     ],
     manifest = "AndroidManifest.xml",
     deps = [
         ":core_java",
+        ":logging",
         "//mediapipe/tasks/java/com/google/mediapipe/tasks/core/jni/proto:llm_options_java_proto_lite",
         "//mediapipe/tasks/java/com/google/mediapipe/tasks/core/jni/proto:llm_response_context_java_proto_lite",
         "//third_party/java/protobuf:protobuf_lite",
@@ -94,8 +102,6 @@ android_library(
         "@maven//:com_google_guava_guava",
     ],
 )
-
-load("//mediapipe/tasks/java/com/google/mediapipe/tasks:mediapipe_tasks_aar.bzl", "mediapipe_tasks_core_aar")
 
 mediapipe_tasks_core_aar(
     name = "tasks_core",

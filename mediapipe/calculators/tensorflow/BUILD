@@ -13,8 +13,8 @@
 # limitations under the License.
 #
 
-# Placeholder: load py_proto_library
 load("//mediapipe/framework/port:build_config.bzl", "mediapipe_cc_proto_library", "mediapipe_proto_library")
+# Placeholder: load py_proto_library
 
 licenses(["notice"])
 
@@ -982,12 +982,12 @@ cc_test(
         "//mediapipe/framework/port:status",
         "//mediapipe/framework/tool:tag_map_helper",
         "//mediapipe/framework/tool:validate_type",
-        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:direct_session",
         "@org_tensorflow//tensorflow/core:framework",
         "@org_tensorflow//tensorflow/core:protos_all_cc",
-        "@org_tensorflow//tensorflow/core:testlib",
         "@org_tensorflow//tensorflow/core/kernels:conv_ops",
         "@org_tensorflow//tensorflow/core/kernels:math",
     ],
@@ -1013,12 +1013,12 @@ cc_test(
         "//mediapipe/framework/port:status",
         "//mediapipe/framework/tool:tag_map_helper",
         "//mediapipe/framework/tool:validate_type",
-        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:direct_session",
         "@org_tensorflow//tensorflow/core:framework",
         "@org_tensorflow//tensorflow/core:protos_all_cc",
-        "@org_tensorflow//tensorflow/core:testlib",
         "@org_tensorflow//tensorflow/core/kernels:conv_ops",
         "@org_tensorflow//tensorflow/core/kernels:math",
     ],
@@ -1042,8 +1042,9 @@ cc_test(
         "//mediapipe/framework/port:parse_text_proto",
         "//mediapipe/framework/tool:tag_map_helper",
         "//mediapipe/framework/tool:validate_type",
-        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:all_kernels",
         "@org_tensorflow//tensorflow/core:direct_session",
         "@org_tensorflow//tensorflow/core:protos_all_cc",
@@ -1069,8 +1070,9 @@ cc_test(
         "//mediapipe/framework/port:parse_text_proto",
         "//mediapipe/framework/tool:tag_map_helper",
         "//mediapipe/framework/tool:validate_type",
-        "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest",
+        "@com_google_protobuf//:protobuf",
         "@org_tensorflow//tensorflow/core:all_kernels",
         "@org_tensorflow//tensorflow/core:direct_session",
         "@org_tensorflow//tensorflow/core:protos_all_cc",
@@ -1270,6 +1272,7 @@ cc_test(
         "@com_google_absl//absl/flags:flag",
         "@com_google_absl//absl/log:absl_check",
         "@com_google_absl//absl/log:absl_log",
+        "@com_google_googletest//:gtest",
     ] + select({
         "//conditions:default": [
             "@org_tensorflow//tensorflow/core:direct_session",
